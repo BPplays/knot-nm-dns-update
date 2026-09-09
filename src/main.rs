@@ -78,7 +78,7 @@ fn get_knot_servers() -> Result<Vec<IpAddr>> {
 fn set_knot_servers(servers: &[IpAddr]) -> Result<()> {
     let value = serde_json::json!([
         {
-            "subtree": ["."],
+            "subtree": ".",
             "servers": servers,
         }
     ]);
