@@ -117,7 +117,10 @@ fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
     Ok(domains)
 }
 
-fn set_knot_servers(servers: &[IpAddr], anti_rfc6761: &[String]) -> Result<()> {
+fn build_forward_config(
+    servers: &[IpAddr],
+    anti_rfc6761: &[String],
+) -> Value {
     let mut forwards = vec![
         serde_json::json!({
             "subtree": ".",
@@ -125,7 +128,6 @@ fn set_knot_servers(servers: &[IpAddr], anti_rfc6761: &[String]) -> Result<()> {
         }),
     ];
 
-    // Use one forwarder rule for the entire anti-RFC6761 set.
     if !anti_rfc6761.is_empty() {
         forwards.push(serde_json::json!({
             "subtree": anti_rfc6761,
@@ -136,16 +138,18 @@ fn set_knot_servers(servers: &[IpAddr], anti_rfc6761: &[String]) -> Result<()> {
         }));
     }
 
-    let json = serde_json::to_string(&forwards)?;
+    Value::Array(forwards)
+}
 
+fn get_knot_forward() -> Result<Value> {
     let output = Command::new("kresctl")
         .args([
             "config",
-            "set",
+            "get",
+            "--json",
             "-p",
             "/forward",
         ])
-        .arg(json)
         .output()
         .context("failed to execute kresctl")?;
 
@@ -156,8 +160,51 @@ fn set_knot_servers(servers: &[IpAddr], anti_rfc6761: &[String]) -> Result<()> {
         );
     }
 
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .context("invalid JSON from kresctl")
+}
+
+fn set_knot_forward(config: &Value) -> Result<()> {
+    let json = serde_json::to_vec(config)?;
+
+    let mut child = Command::new("kresctl")
+        .args([
+            "config",
+            "set",
+            "-p",
+            "/forward",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to execute kresctl")?;
+
+    child
+        .stdin
+        .take()
+        .context("failed to open kresctl stdin")?
+        .write_all(&json)
+        .context("failed to write configuration to kresctl")?;
+
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for kresctl")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "kresctl failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     Ok(())
 }
+
 fn main() -> Result<()> {
     let desired = read_nameservers(RESOLV_CONF)?;
 
