@@ -9,6 +9,7 @@ use std::{
 };
 
 const RESOLV_CONF: &str = "/run/NetworkManager/resolv.conf";
+const RESOLV_ANTI_RFC6761: &str = "/etc/resolv.anti_rfc6761";
 
 fn read_nameservers(path: impl AsRef<Path>) -> Result<Vec<IpAddr>> {
     let data = fs::read(path.as_ref())
@@ -75,15 +76,67 @@ fn get_knot_servers() -> Result<Vec<IpAddr>> {
         .collect()
 }
 
-fn set_knot_servers(servers: &[IpAddr]) -> Result<()> {
-    let value = serde_json::json!([
-        {
+fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
+    let data = fs::read_to_string(path.as_ref())
+        .with_context(|| format!("failed to read {}", path.as_ref().display()))?;
+
+    let mut domains = Vec::new();
+
+    for line in data.lines() {
+        let line = line.trim();
+
+        // Ignore blank lines and full-line comments.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Allow inline comments as well.
+        let domain = line
+            .split_once('#')
+            .map_or(line, |(domain, _)| domain)
+            .trim();
+
+        if domain.is_empty() {
+            continue;
+        }
+
+        // Knot accepts domain names with or without the trailing dot,
+        // but normalize them to absolute DNS names.
+        let domain = if domain == "." || domain.ends_with('.') {
+            domain.to_string()
+        } else {
+            format!("{domain}.")
+        };
+
+        domains.push(domain);
+    }
+
+    domains.sort_unstable();
+    domains.dedup();
+
+    Ok(domains)
+}
+
+fn set_knot_servers(servers: &[IpAddr], anti_rfc6761: &[String]) -> Result<()> {
+    let mut forwards = vec![
+        serde_json::json!({
             "subtree": ".",
             "servers": servers,
-        }
-    ]);
+        }),
+    ];
 
-    let json = serde_json::to_string(&value)?;
+    // Use one forwarder rule for the entire anti-RFC6761 set.
+    if !anti_rfc6761.is_empty() {
+        forwards.push(serde_json::json!({
+            "subtree": anti_rfc6761,
+            "servers": servers,
+            "options": {
+                "dnssec": false,
+            },
+        }));
+    }
+
+    let json = serde_json::to_string(&forwards)?;
 
     let output = Command::new("kresctl")
         .args([
@@ -105,7 +158,6 @@ fn set_knot_servers(servers: &[IpAddr]) -> Result<()> {
 
     Ok(())
 }
-
 fn main() -> Result<()> {
     let desired = read_nameservers(RESOLV_CONF)?;
 
@@ -115,13 +167,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)?;
+
     let current = get_knot_servers()?;
 
     if current == desired {
         return Ok(());
     }
 
-    set_knot_servers(&desired)?;
+    set_knot_servers(&desired, &anti_rfc6761)?;
 
     Ok(())
 }
