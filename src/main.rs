@@ -3,6 +3,7 @@ use resolv_conf::Config;
 use serde_json::Value;
 use std::{
     fs,
+    io::Write,
     net::IpAddr,
     path::Path,
     process::{Command, Stdio},
@@ -29,53 +30,6 @@ fn read_nameservers(path: impl AsRef<Path>) -> Result<Vec<IpAddr>> {
         .collect())
 }
 
-fn get_knot_servers() -> Result<Vec<IpAddr>> {
-    let output = Command::new("kresctl")
-        .args([
-            "config",
-            "get",
-            "--json",
-            "-p",
-            "/forward",
-        ])
-        .output()
-        .context("failed to execute kresctl")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "kresctl failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    // No /forward configuration means there are no forwarders.
-    if output.stdout.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Vec::new());
-    }
-
-    let value: Value =
-        serde_json::from_slice(&output.stdout).context("invalid JSON from kresctl")?;
-
-    let servers = value
-        .get("0")
-        .and_then(|v| v.get("servers"))
-        .and_then(Value::as_array);
-
-    servers
-        .into_iter()
-        .flatten()
-        .map(|value| {
-            value
-                .as_str()
-                .context("Knot forwarder is not a string")
-                .and_then(|s| {
-                    s.parse()
-                        .with_context(|| format!("invalid Knot forwarder: {s}"))
-                })
-        })
-        .collect()
-}
-
 fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
     let data = fs::read_to_string(path.as_ref())
         .with_context(|| format!("failed to read {}", path.as_ref().display()))?;
@@ -85,12 +39,10 @@ fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
     for line in data.lines() {
         let line = line.trim();
 
-        // Ignore blank lines and full-line comments.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        // Allow inline comments as well.
         let domain = line
             .split_once('#')
             .map_or(line, |(domain, _)| domain)
@@ -100,8 +52,6 @@ fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
             continue;
         }
 
-        // Knot accepts domain names with or without the trailing dot,
-        // but normalize them to absolute DNS names.
         let domain = if domain == "." || domain.ends_with('.') {
             domain.to_string()
         } else {
@@ -216,13 +166,14 @@ fn main() -> Result<()> {
 
     let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)?;
 
-    let current = get_knot_servers()?;
+    let desired_forward = build_forward_config(&desired, &anti_rfc6761);
+    let current_forward = get_knot_forward()?;
 
-    if current == desired {
+    if current_forward == desired_forward {
         return Ok(());
     }
 
-    set_knot_servers(&desired, &anti_rfc6761)?;
+    set_knot_forward(&desired_forward)?;
 
     Ok(())
 }
