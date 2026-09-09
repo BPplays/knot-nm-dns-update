@@ -1,0 +1,9 @@
+[package]
+name = "knot-nm-dns-update"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+resolv-conf = "0.7.6"
+serde_json = "1.0.151"
