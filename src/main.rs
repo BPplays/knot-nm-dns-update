@@ -76,32 +76,25 @@ fn get_knot_servers() -> Result<Vec<IpAddr>> {
 }
 
 fn set_knot_servers(servers: &[IpAddr]) -> Result<()> {
-    let json = serde_json::to_string(servers)?;
+    let value = serde_json::json!([
+        {
+            "subtree": ["."],
+            "servers": servers,
+        }
+    ]);
 
-    let mut child = Command::new("kresctl")
+    let json = serde_json::to_string(&value)?;
+
+    let output = Command::new("kresctl")
         .args([
             "config",
             "set",
-            "--json",
             "-p",
-            "/forward/0/servers",
+            "/forward",
         ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("failed to start kresctl")?;
-
-    {
-        use std::io::Write;
-
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("failed to open kresctl stdin")?;
-
-        stdin.write_all(json.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
+        .arg(json)
+        .output()
+        .context("failed to execute kresctl")?;
 
     if !output.status.success() {
         anyhow::bail!(
