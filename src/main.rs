@@ -1,18 +1,19 @@
 use anyhow::{Context, Result};
 use resolv_conf::Config;
 use serde_json::Value;
-use log;
 use std::{
-    fs,
+    collections::HashSet,
+    fs::{self, OpenOptions},
     io::Write,
     net::IpAddr,
-    path::Path,
+    path::{Path},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RESOLV_CONF: &str = "/run/NetworkManager/resolv.conf";
+const RESOLV_LATEST: &str = "/run/knot-nm-dns-update/nm-resolv.conf.latest";
 const RESOLV_ANTI_RFC6761: &str = "/etc/resolv.anti_rfc6761";
 
 const RESOLV_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,19 +26,16 @@ struct ForwardRule {
     dnssec: Option<bool>,
 }
 
-fn read_nameservers(path: impl AsRef<Path>) -> Result<Vec<IpAddr>> {
+fn read_resolv_conf(path: impl AsRef<Path>) -> Result<(Vec<IpAddr>, Vec<u8>)> {
     let path = path.as_ref();
     let deadline = Instant::now() + RESOLV_RETRY_TIMEOUT;
 
     let mut last_error;
 
     loop {
-        match read_nameservers_once(path) {
-            Ok(mut nameservers) => {
+        match read_resolv_conf_once(path) {
+            Ok((nameservers, data)) => {
                 if !nameservers.is_empty() {
-                    nameservers.sort_unstable();
-                    nameservers.dedup();
-
                     log::info!(
                         "using {} nameserver(s) from {}: {:?}",
                         nameservers.len(),
@@ -45,7 +43,7 @@ fn read_nameservers(path: impl AsRef<Path>) -> Result<Vec<IpAddr>> {
                         nameservers
                     );
 
-                    return Ok(nameservers);
+                    return Ok((nameservers, data));
                 }
 
                 last_error = Some(anyhow::anyhow!(
@@ -76,14 +74,18 @@ fn read_nameservers(path: impl AsRef<Path>) -> Result<Vec<IpAddr>> {
     }
 }
 
-fn read_nameservers_once(path: &Path) -> Result<Vec<IpAddr>> {
+fn read_resolv_conf_once(path: &Path) -> Result<(Vec<IpAddr>, Vec<u8>)> {
     let data = fs::read(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
     let config = Config::parse(&data)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
-    Ok(config
+    // Preserve the order in resolv.conf while removing duplicate
+    // nameservers after their first occurrence.
+    let mut seen = HashSet::new();
+
+    let nameservers = config
         .nameservers
         .into_iter()
         .filter(|addr| match addr {
@@ -91,7 +93,101 @@ fn read_nameservers_once(path: &Path) -> Result<Vec<IpAddr>> {
             resolv_conf::ScopedIp::V4(_) => true,
         })
         .map(Into::into)
-        .collect())
+        .filter(|addr: &IpAddr| seen.insert(*addr))
+        .collect();
+
+    Ok((nameservers, data))
+}
+
+fn resolv_conf_changed(data: &[u8], latest_path: impl AsRef<Path>) -> Result<bool> {
+    let latest_path = latest_path.as_ref();
+
+    match fs::read(latest_path) {
+        Ok(latest) => Ok(latest != data),
+
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!(
+                "{} does not exist yet",
+                latest_path.display()
+            );
+            Ok(true)
+        }
+
+        Err(err) => Err(err).with_context(|| {
+            format!("failed to read {}", latest_path.display())
+        }),
+    }
+}
+
+fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+    let path = path.as_ref();
+
+    let parent = path.parent().context("atomic write target has no parent")?;
+
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .context("atomic write target has no file name")?
+        .to_string_lossy();
+
+    let pid = std::process::id();
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp-{pid}-{timestamp}"
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary file {}",
+                    tmp_path.display()
+                )
+            })?;
+
+        file.write_all(data)
+            .with_context(|| {
+                format!(
+                    "failed to write temporary file {}",
+                    tmp_path.display()
+                )
+            })?;
+
+        file.sync_all()
+            .with_context(|| {
+                format!(
+                    "failed to sync temporary file {}",
+                    tmp_path.display()
+                )
+            })?;
+
+        fs::rename(&tmp_path, path)
+            .with_context(|| {
+                format!(
+                    "failed to atomically replace {}",
+                    path.display()
+                )
+            })?;
+
+        Ok(())
+    })();
+
+    // If anything failed before rename, remove the temporary file.
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
 }
 
 fn read_anti_rfc6761(path: impl AsRef<Path>) -> Result<Vec<String>> {
@@ -325,7 +421,19 @@ fn main() -> Result<()> {
 
     log::info!("starting Knot Resolver NetworkManager DNS updater");
 
-    let desired_nameservers = read_nameservers(RESOLV_CONF)?;
+    let (desired_nameservers, resolv_conf_data) =
+        read_resolv_conf(RESOLV_CONF)?;
+
+    // Fast path: NetworkManager has not changed resolv.conf since our
+    // previous successful run, so there is nothing for us to do.
+    if !resolv_conf_changed(&resolv_conf_data, RESOLV_LATEST)? {
+        log::info!(
+            "{} is unchanged; exiting early",
+            RESOLV_CONF
+        );
+
+        return Ok(());
+    }
 
     let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)
         .with_context(|| {
@@ -353,6 +461,14 @@ fn main() -> Result<()> {
 
     if current_canonical == desired_canonical {
         log::info!("Knot /forward is already up to date");
+
+        atomic_write(RESOLV_LATEST, &resolv_conf_data)?;
+
+        log::debug!(
+            "updated {} atomically",
+            RESOLV_LATEST
+        );
+
         return Ok(());
     }
 
@@ -372,5 +488,14 @@ fn main() -> Result<()> {
 
     log::info!("Knot /forward updated successfully");
 
+    atomic_write(RESOLV_LATEST, &resolv_conf_data)?;
+
+    log::debug!(
+        "updated {} atomically",
+        RESOLV_LATEST
+    );
+
     Ok(())
 }
+
+
