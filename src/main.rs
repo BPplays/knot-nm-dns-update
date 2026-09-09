@@ -459,32 +459,24 @@ fn main() -> Result<()> {
     let current_canonical = canonicalize_forward(&current_forward)
         .context("failed to canonicalize current Knot forward configuration")?;
 
-    if current_canonical == desired_canonical {
-        log::info!("Knot /forward is already up to date");
-
-        atomic_write(RESOLV_LATEST, &resolv_conf_data)?;
+    if current_canonical != desired_canonical {
+        log::info!("Knot /forward differs from desired configuration");
 
         log::debug!(
-            "updated {} atomically",
-            RESOLV_LATEST
+            "current canonical /forward: {:#?}",
+            current_canonical
         );
 
-        return Ok(());
+        log::debug!(
+            "desired canonical /forward: {:#?}",
+            desired_canonical
+        );
+
+        set_knot_forward(&desired_forward)?;
+    } else {
+        log::info!("Knot /forward is already up to date");
     }
 
-    log::info!("Knot /forward differs from desired configuration");
-
-    log::debug!(
-        "current canonical /forward: {:#?}",
-        current_canonical
-    );
-
-    log::debug!(
-        "desired canonical /forward: {:#?}",
-        desired_canonical
-    );
-
-    set_knot_forward(&desired_forward)?;
 
     log::info!("Knot /forward updated successfully");
 
