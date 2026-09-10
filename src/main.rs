@@ -339,12 +339,11 @@ fn get_knot_forward(sock: &str) -> Result<Value> {
 				.await?
 				.to_bytes();
 
-			return Err(format!(
+			anyhow::bail!(
 				"Knot Resolver API returned {}: {}",
 				status,
 				String::from_utf8_lossy(&body),
-			)
-			.into());
+			);
 		}
 
 		let body = http_body_util::BodyExt::collect(response)
