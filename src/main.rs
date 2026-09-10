@@ -321,7 +321,7 @@ fn get_knot_forward(sock: &str) -> Result<Value> {
 	let body: Bytes = runtime.block_on(async {
 		let client = Client::unix();
 
-		let uri = Uri::new(
+		let uri: hyper::Uri = Uri::new(
 			sock,
 			"/v1/config/forward",
 		)
@@ -371,7 +371,7 @@ fn set_knot_forward(config: &Value, sock: &str) -> Result<()> {
 	runtime.block_on(async {
 		let client = Client::unix();
 
-		let uri = Uri::new(
+		let uri: hyper::Uri = Uri::new(
 			sock,
 			"/v1/config/forward",
 		)
