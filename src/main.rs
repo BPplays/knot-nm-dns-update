@@ -12,6 +12,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use http_body_util::{Empty, Full};
+use hyper::{body::Bytes, Request};
+use hyper_util::{
+    client::legacy::Client,
+    rt::TokioExecutor,
+};
+use hyperlocal::{UnixClientExt, Uri};
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -33,6 +41,8 @@ const RESOLV_ANTI_RFC6761: &str = "/etc/resolv.anti_rfc6761";
 
 const RESOLV_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLV_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+const KRES_API_SOCK: &str = "/run/knot-resolver/kres-api.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForwardRule {
@@ -301,29 +311,51 @@ fn build_forward_config(
 }
 
 fn get_knot_forward() -> Result<Value> {
-    let output = Command::new("kresctl")
-        .args([
-            "config",
-            "get",
-            "--json",
-            "-p",
-            "/forward",
-        ])
-        .output()
-        .context("failed to execute kresctl")?;
+    let runtime = tokio::runtime::Runtime::new()?;
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "kresctl config get failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
 
-    if output.stdout.iter().all(u8::is_ascii_whitespace) {
+    let body: Bytes = runtime.block_on(async {
+        let client = Client::unix();
+
+        let uri = Uri::new(
+            KRES_API_SOCK,
+            "/v1/config/forward",
+        )
+            .into();
+
+        let request = Request::get(uri)
+            .body(Empty::<Bytes>::new())?;
+
+        let response = client.request(request).await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = http_body_util::BodyExt::collect(response)
+                .await?
+                .to_bytes();
+
+            return Err(format!(
+                "Knot Resolver API returned {}: {}",
+                status,
+                String::from_utf8_lossy(&body),
+            )
+            .into());
+        }
+
+        let body = http_body_util::BodyExt::collect(response)
+            .await?
+            .to_bytes();
+
+        Ok::<Bytes, Box<dyn std::error::Error>>(body)
+    })?;
+
+
+    if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(Value::Array(Vec::new()));
     }
 
-    serde_json::from_slice(&output.stdout)
+    serde_json::from_slice(&body)
         .context("invalid JSON from kresctl")
 }
 
@@ -331,36 +363,39 @@ fn set_knot_forward(config: &Value) -> Result<()> {
     let json = serde_json::to_vec(config)
         .context("failed to serialize Knot forward configuration")?;
 
-    let mut child = Command::new("kresctl")
-        .args([
-            "config",
-            "set",
-            "-p",
-            "/forward",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to execute kresctl")?;
+    let runtime = tokio::runtime::Runtime::new()?;
 
-    child
-        .stdin
-        .take()
-        .context("failed to open kresctl stdin")?
-        .write_all(&json)
-        .context("failed to write configuration to kresctl")?;
+    runtime.block_on(async {
+        let client = Client::unix();
 
-    let output = child
-        .wait_with_output()
-        .context("failed waiting for kresctl")?;
+        let uri = Uri::new(
+            KRES_API_SOCK,
+            "/v1/config/forward",
+        )
+        .into();
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "kresctl config set failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+        let request = Request::put(uri)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(json)))?;
+
+        let response = client.request(request).await?;
+
+        let status = response.status();
+
+        let body = http_body_util::BodyExt::collect(response)
+            .await?
+            .to_bytes();
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "Knot Resolver API returned {}: {}",
+                status,
+                String::from_utf8_lossy(&body).trim()
+            );
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     Ok(())
 }
