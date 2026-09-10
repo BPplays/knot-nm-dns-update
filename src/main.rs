@@ -351,7 +351,7 @@ fn get_knot_forward(sock: &str) -> Result<Value> {
 			.await?
 			.to_bytes();
 
-		Ok::<Bytes, Box<dyn std::error::Error>>(body)
+		Ok::<Bytes, anyhow::Error>(body)
 	})?;
 
 
