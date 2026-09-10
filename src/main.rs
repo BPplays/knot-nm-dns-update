@@ -12,8 +12,20 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const RESOLV_CONF: &str = "/run/NetworkManager/resolv.conf";
-const RESOLV_LATEST: &str = "/run/knot-nm-dns-update/nm-resolv.conf.latest";
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Copy NetworkManager's search domains into /etc/resolv.conf.
+    #[arg(short = 's', long = "search")]
+    search: bool,
+}
+
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+const RESOLV_NM_CONF: &str = "/run/NetworkManager/resolv.conf";
+const RESOLV_NM_LATEST: &str = "/run/knot-nm-dns-update/nm-resolv.conf.latest";
 const RESOLV_ANTI_RFC6761: &str = "/etc/resolv.anti_rfc6761";
 
 const RESOLV_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,7 +38,16 @@ struct ForwardRule {
     dnssec: Option<bool>,
 }
 
-fn read_resolv_conf(path: impl AsRef<Path>) -> Result<(Vec<IpAddr>, Vec<u8>)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvData {
+    nameservers: Vec<IpAddr>,
+    search_domains: Vec<String>,
+    bytes: Vec<u8>,
+}
+
+fn read_resolv_conf(
+    path: impl AsRef<Path>,
+) -> Result<ResolvData> {
     let path = path.as_ref();
     let deadline = Instant::now() + RESOLV_RETRY_TIMEOUT;
 
@@ -34,16 +55,16 @@ fn read_resolv_conf(path: impl AsRef<Path>) -> Result<(Vec<IpAddr>, Vec<u8>)> {
 
     loop {
         match read_resolv_conf_once(path) {
-            Ok((nameservers, data)) => {
-                if !nameservers.is_empty() {
+            Ok(data) => {
+                if !data.nameservers.is_empty() {
                     log::info!(
                         "using {} nameserver(s) from {}: {:?}",
-                        nameservers.len(),
+                        data.nameservers.len(),
                         path.display(),
-                        nameservers
+                        data.nameservers
                     );
 
-                    return Ok((nameservers, data));
+                    return Ok(data);
                 }
 
                 last_error = Some(anyhow::anyhow!(
@@ -74,7 +95,9 @@ fn read_resolv_conf(path: impl AsRef<Path>) -> Result<(Vec<IpAddr>, Vec<u8>)> {
     }
 }
 
-fn read_resolv_conf_once(path: &Path) -> Result<(Vec<IpAddr>, Vec<u8>)> {
+fn read_resolv_conf_once(
+    path: &Path,
+) -> Result<ResolvData> {
     let data = fs::read(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
@@ -86,7 +109,7 @@ fn read_resolv_conf_once(path: &Path) -> Result<(Vec<IpAddr>, Vec<u8>)> {
     let mut seen = HashSet::new();
 
     let nameservers = config
-        .nameservers
+        .nameservers.clone()
         .into_iter()
         .filter(|addr| match addr {
             resolv_conf::ScopedIp::V6(_, scope) => scope.is_none(),
@@ -96,7 +119,16 @@ fn read_resolv_conf_once(path: &Path) -> Result<(Vec<IpAddr>, Vec<u8>)> {
         .filter(|addr: &IpAddr| seen.insert(*addr))
         .collect();
 
-    Ok((nameservers, data))
+    let search_domains = config
+        .get_search()
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(ResolvData {
+        nameservers,
+        search_domains,
+        bytes: data,
+    })
 }
 
 fn resolv_conf_changed(data: &[u8], latest_path: impl AsRef<Path>) -> Result<bool> {
@@ -416,20 +448,122 @@ fn canonicalize_forward(value: &Value) -> Result<Vec<ForwardRule>> {
     Ok(result)
 }
 
+
+fn update_search_domains(
+    path: impl AsRef<Path>,
+    search_domains: &[String],
+) -> Result<()> {
+    let path = path.as_ref();
+
+    let current = read_resolv_conf_once(path)?;
+
+    // Nothing to change.
+    if current.search_domains == search_domains {
+        log::debug!(
+            "{} search domains are already up to date: {:?}",
+            path.display(),
+            search_domains
+        );
+
+        return Ok(());
+    }
+
+    let text = String::from_utf8(current.bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+
+    let replacement = if search_domains.is_empty() {
+        None
+    } else {
+        Some(format!("search {}", search_domains.join(" ")))
+    };
+
+    let mut output = String::with_capacity(text.len() + 256);
+    let mut replaced = false;
+
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = line_without_newline.strip_suffix('\r').unwrap_or(line_without_newline);
+
+        let trimmed = content.trim_start();
+
+        if trimmed == "search" || trimmed.starts_with("search ") {
+            replaced = true;
+
+            if let Some(replacement) = &replacement {
+                output.push_str(replacement);
+
+                // Preserve CRLF if the original line used it.
+                if line_without_newline.ends_with('\r') {
+                    output.push('\r');
+                }
+
+                if line.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+
+            continue;
+        }
+
+        output.push_str(line);
+    }
+
+    // No existing search directive: add one only when needed.
+    if !replaced {
+        if let Some(replacement) = &replacement {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+
+            output.push_str(replacement);
+            output.push('\n');
+        }
+    }
+
+    if output.as_bytes() == text.as_bytes() {
+        log::debug!(
+            "{} search-domain update produced no changes",
+            path.display()
+        );
+
+        return Ok(());
+    }
+
+    atomic_write(path, output.as_bytes())?;
+
+    log::info!(
+        "updated search domains in {}: {:?}",
+        path.display(),
+        search_domains
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
+    let cli = Cli::parse();
+
     log::info!("starting Knot Resolver NetworkManager DNS updater");
 
-    let (desired_nameservers, resolv_conf_data) =
-        read_resolv_conf(RESOLV_CONF)?;
+    // let (desired_nameservers, search_domains, resolv_conf_data) =
+    let desired_resolv =
+        read_resolv_conf(RESOLV_NM_CONF)?;
+
+    if cli.search {
+        update_search_domains(
+            RESOLV_CONF,
+            &desired_resolv.search_domains,
+        )?;
+    }
 
     // Fast path: NetworkManager has not changed resolv.conf since our
     // previous successful run, so there is nothing for us to do.
-    if !resolv_conf_changed(&resolv_conf_data, RESOLV_LATEST)? {
+    if !resolv_conf_changed(&desired_resolv.bytes, RESOLV_NM_LATEST)? {
         log::info!(
             "{} is unchanged; exiting early",
-            RESOLV_CONF
+            RESOLV_NM_CONF
         );
 
         return Ok(());
@@ -449,7 +583,7 @@ fn main() -> Result<()> {
     );
 
     let desired_forward =
-        build_forward_config(&desired_nameservers, &anti_rfc6761);
+        build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
 
     let current_forward = get_knot_forward()?;
 
@@ -480,11 +614,11 @@ fn main() -> Result<()> {
 
     log::info!("Knot /forward updated successfully");
 
-    atomic_write(RESOLV_LATEST, &resolv_conf_data)?;
+    atomic_write(RESOLV_NM_LATEST, &desired_resolv.bytes)?;
 
     log::debug!(
         "updated {} atomically",
-        RESOLV_LATEST
+        RESOLV_NM_LATEST
     );
 
     Ok(())
