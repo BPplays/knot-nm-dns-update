@@ -25,9 +25,13 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
+	/// unix socket path for knot-resolver kres-api.
+	#[arg(long = "kres-api-sock", default_value = "/run/knot-resolver/kres-api.sock")]
+	kres_api_sock: String,
+
 	/// Copy NetworkManager's search domains into /etc/resolv.conf.
-	#[arg(short = 's', long = "search")]
-	search: bool,
+	#[arg(long = "copy-search")]
+	copy_search: bool,
 }
 
 const RESOLV_CONF: &str = "/etc/resolv.conf";
@@ -310,7 +314,7 @@ fn build_forward_config(
 	Value::Array(forwards)
 }
 
-fn get_knot_forward() -> Result<Value> {
+fn get_knot_forward(sock: &str) -> Result<Value> {
 	let runtime = tokio::runtime::Runtime::new()?;
 
 
@@ -318,7 +322,7 @@ fn get_knot_forward() -> Result<Value> {
 		let client = Client::unix();
 
 		let uri = Uri::new(
-			KRES_API_SOCK,
+			sock,
 			"/v1/config/forward",
 		)
 			.into();
@@ -359,7 +363,7 @@ fn get_knot_forward() -> Result<Value> {
 		.context("invalid JSON from kresctl")
 }
 
-fn set_knot_forward(config: &Value) -> Result<()> {
+fn set_knot_forward(config: &Value, sock: &str) -> Result<()> {
 	let json = serde_json::to_vec(config)
 		.context("failed to serialize Knot forward configuration")?;
 
@@ -369,7 +373,7 @@ fn set_knot_forward(config: &Value) -> Result<()> {
 		let client = Client::unix();
 
 		let uri = Uri::new(
-			KRES_API_SOCK,
+			sock,
 			"/v1/config/forward",
 		)
 		.into();
@@ -589,7 +593,7 @@ fn main() -> Result<()> {
 	let desired_resolv =
 		read_resolv_conf(RESOLV_NM_CONF)?;
 
-	if cli.search {
+	if cli.copy_search {
 		update_search_domains(
 			RESOLV_CONF,
 			&desired_resolv.search_domains,
@@ -648,7 +652,7 @@ fn main() -> Result<()> {
 	let desired_forward =
 		build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
 
-	let current_forward = get_knot_forward()?;
+	let current_forward = get_knot_forward(cli.kres_api_sock)?;
 
 	let desired_canonical = canonicalize_forward(&desired_forward)
 		.context("failed to canonicalize desired forward configuration")?;
@@ -669,7 +673,7 @@ fn main() -> Result<()> {
 			desired_canonical
 		);
 
-		set_knot_forward(&desired_forward)?;
+		set_knot_forward(&desired_forward, cli.kres_api_sock)?;
 	} else {
 		log::info!("Knot /forward is already up to date");
 	}
