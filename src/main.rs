@@ -23,6 +23,9 @@ struct Cli {
 }
 
 const RESOLV_CONF: &str = "/etc/resolv.conf";
+const KNOT_RESOLVER_LAST_STARTED: &str = "/run/knot-resolver/last_started";
+const KNOT_RESOLVER_LAST_STARTED_KNOWN: &str =
+    "/run/knot-nm-dns-update/knot-resolver.last_started.known";
 
 const RESOLV_NM_CONF: &str = "/run/NetworkManager/resolv.conf";
 const RESOLV_NM_LATEST: &str = "/run/knot-nm-dns-update/nm-resolv.conf.latest";
@@ -558,9 +561,34 @@ fn main() -> Result<()> {
         )?;
     }
 
+
+    let last_started_changed;
+    let current_last_started = fs::read(KNOT_RESOLVER_LAST_STARTED);
+
+    let known_last_started = fs::read(KNOT_RESOLVER_LAST_STARTED_KNOWN);
+    match (&current_last_started, &known_last_started) {
+        (Ok(current), Ok(known)) if current == known => {
+            last_started_changed = false;
+            log::debug!(
+                "{} has the same content as {}",
+                KNOT_RESOLVER_LAST_STARTED,
+                KNOT_RESOLVER_LAST_STARTED_KNOWN,
+            );
+        }
+        (Ok(_), Ok(_)) => {
+            // Different contents
+            last_started_changed = true;
+        }
+        _ => {
+            // One or both reads failed
+            last_started_changed = true;
+        }
+    }
+
     // Fast path: NetworkManager has not changed resolv.conf since our
     // previous successful run, so there is nothing for us to do.
-    if !resolv_conf_changed(&desired_resolv.bytes, RESOLV_NM_LATEST)? {
+    if !resolv_conf_changed(&desired_resolv.bytes, RESOLV_NM_LATEST)? &&
+        !last_started_changed {
         log::info!(
             "{} is unchanged; exiting early",
             RESOLV_NM_CONF
@@ -620,6 +648,27 @@ fn main() -> Result<()> {
         "updated {} atomically",
         RESOLV_NM_LATEST
     );
+
+
+    match &current_last_started {
+        Ok(current) if last_started_changed => {
+            atomic_write(
+                KNOT_RESOLVER_LAST_STARTED_KNOWN,
+                &current,
+            )?;
+
+            log::debug!(
+                "updated {} atomically",
+                KNOT_RESOLVER_LAST_STARTED_KNOWN,
+            );
+        }
+        _ => {
+            log::error!(
+                "read failed for {}",
+                KNOT_RESOLVER_LAST_STARTED,
+            );
+        }
+    }
 
     Ok(())
 }
