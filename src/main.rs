@@ -622,7 +622,7 @@ fn matches_known(
 		(Ok(current), Ok(known)) => {
 			let current_hashed = known_hash(current);
 
-			if current_hashed == known {
+			if current_hashed.as_ref() == known.as_slice() {
 				log::debug!(
 					"{:?} has the same content as {:?}",
 					&input_path,
