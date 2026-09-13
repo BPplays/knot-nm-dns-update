@@ -1,15 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Ok, Result};
 use resolv_conf::Config;
 use serde_json::Value;
 use std::{
-	collections::HashSet,
-	fs::{self, OpenOptions},
-	io::Write,
-	net::IpAddr,
-	path::{Path},
-	process::{Command, Stdio},
-	thread,
-	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+	collections::HashSet, fs::{self, OpenOptions}, io::Write, net::IpAddr, path::{Path, PathBuf}, process::{Command, Stdio}, thread::{self, current}, time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use http_body_util::{Empty, Full};
@@ -20,6 +13,9 @@ use hyper_util::{
 };
 use hyperlocal::{UnixClientExt, Uri};
 
+use sha3::{Digest, Sha3_256, Sha3_512};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -27,26 +23,28 @@ use clap::Parser;
 struct Cli {
 	/// unix socket path for knot-resolver kres-api.
 	#[arg(long = "kres-api-sock", default_value = "/run/knot-resolver/kres-api.sock")]
-	kres_api_sock: String,
+	kres_api_sock: Path,
 
 	/// Copy NetworkManager's search domains into /etc/resolv.conf.
 	#[arg(long = "copy-search")]
 	copy_search: bool,
+
+	/// Skip heuristic optimizations like only running when relevant files have changed
+	#[arg(long)]
+	always_apply: bool,
 }
 
-const RESOLV_CONF: &str = "/etc/resolv.conf";
-const KNOT_RESOLVER_LAST_STARTED: &str = "/run/knot-resolver/last_started";
-const KNOT_RESOLVER_LAST_STARTED_KNOWN: &str =
-	"/run/knot-nm-dns-update/knot-resolver.last_started.known";
+const RESOLV_CONF: &Path = "/etc/resolv.conf".into();
+const RUN_DIR: &Path = "/run/knot-nm-dns-update".into();
+const RESOLV_ANTI_RFC6761: &Path = "/etc/resolv.anti_rfc6761".into();
 
-const RESOLV_NM_CONF: &str = "/run/NetworkManager/resolv.conf";
-const RESOLV_NM_LATEST: &str = "/run/knot-nm-dns-update/nm-resolv.conf.latest";
-const RESOLV_ANTI_RFC6761: &str = "/etc/resolv.anti_rfc6761";
+
+const KNOT_RESOLVER_LAST_STARTED: &Path = "/run/knot-resolver/last_started".into();
+
+const RESOLV_NM_CONF: &Path = "/run/NetworkManager/resolv.conf".into();
 
 const RESOLV_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLV_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
-const KRES_API_SOCK: &str = "/run/knot-resolver/kres-api.sock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForwardRule {
@@ -148,27 +146,7 @@ fn read_resolv_conf_once(
 	})
 }
 
-fn resolv_conf_changed(data: &[u8], latest_path: impl AsRef<Path>) -> Result<bool> {
-	let latest_path = latest_path.as_ref();
-
-	match fs::read(latest_path) {
-		Ok(latest) => Ok(latest != data),
-
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-			log::debug!(
-				"{} does not exist yet",
-				latest_path.display()
-			);
-			Ok(true)
-		}
-
-		Err(err) => Err(err).with_context(|| {
-			format!("failed to read {}", latest_path.display())
-		}),
-	}
-}
-
-fn atomic_write(path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
+fn atomic_write(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
 	let path = path.as_ref();
 
 	let parent = path.parent().context("atomic write target has no parent")?;
@@ -314,7 +292,7 @@ fn build_forward_config(
 	Value::Array(forwards)
 }
 
-fn get_knot_forward(sock: &str) -> Result<Value> {
+fn get_knot_forward(sock: impl AsRef<Path>) -> Result<Value> {
 	let runtime = tokio::runtime::Runtime::new()?;
 
 
@@ -324,8 +302,7 @@ fn get_knot_forward(sock: &str) -> Result<Value> {
 		let uri: hyper::Uri = Uri::new(
 			sock,
 			"/v1/config/forward",
-		)
-			.into();
+		).into();
 
 		let request = Request::get(uri)
 			.body(Empty::<Bytes>::new())?;
@@ -362,7 +339,7 @@ fn get_knot_forward(sock: &str) -> Result<Value> {
 		.context("invalid JSON from kresctl")
 }
 
-fn set_knot_forward(config: &Value, sock: &str) -> Result<()> {
+fn set_knot_forward(config: &Value, sock: impl AsRef<Path>) -> Result<()> {
 	let json = serde_json::to_vec(config)
 		.context("failed to serialize Knot forward configuration")?;
 
@@ -374,8 +351,7 @@ fn set_knot_forward(config: &Value, sock: &str) -> Result<()> {
 		let uri: hyper::Uri = Uri::new(
 			sock,
 			"/v1/config/forward",
-		)
-		.into();
+		).into();
 
 		let request = Request::put(uri)
 			.header("Content-Type", "application/json")
@@ -581,6 +557,92 @@ fn update_search_domains(
 	Ok(())
 }
 
+fn default_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
+    let mut hasher = Sha3_512::new();
+    hasher.update(b);
+
+    let hash = hasher.finalize();
+	return hash;
+}
+
+fn default_hash_base64(b: impl AsRef<[u8]>) -> string {
+	let hash = default_hash(b);
+	let encoded = URL_SAFE_NO_PAD.encode(hash);
+	return encoded
+}
+
+fn get_known_path(path: impl AsRef<Path>) -> PathBuf {
+	let path = path.as_ref();
+    let mut hasher = Sha3_256::new();
+    hasher.update(path.as_os_str().as_encoded_bytes());
+
+    let hash = hasher.finalize();
+	let encoded = URL_SAFE_NO_PAD.encode(hash);
+	let known_path = RUN_DIR.join("known").join(encoded);
+	return known_path
+}
+
+fn write_known(
+	path: impl AsRef<Path>,
+	data: &[u8],
+) -> Result<()> {
+	return atomic_write(
+		get_known_path(path.as_ref()),
+		known_hash(&data),
+	)
+}
+
+fn known_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
+	default_hash(b);
+}
+
+fn matches_known(
+	input_path: impl AsRef<Path>,
+	input_data: Option<impl AsRef<[u8]>>,
+) -> bool {
+	let path = input_path.as_ref();
+
+    let input_data: Result<Vec<u8>, Error> = match input_data {
+        Some(data) => Ok(data.as_ref().to_vec()),
+        None => fs::read(path).map_err(Error::from),
+    };
+
+	let input_data_hashed = known_hash(input_data);
+
+	let known_path = get_known_path(path);
+	let known_data = fs::read(known_path);
+
+	match (&input_data_hashed, &known_data) {
+		(Ok(current), Ok(known)) if current == known => {
+			log::debug!(
+				"{} has the same content as {}",
+				input_path,
+				known_path,
+			);
+
+			true
+		}
+		(Ok(_), Ok(_)) => {
+			// Different contents
+			false
+		}
+		_ => {
+			// One or both reads failed
+			false
+		}
+	}
+
+}
+
+fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
+	let path = path.as_ref();
+
+    let modified = fs::metadata(path)?.modified()?;
+
+	let time_since = SystemTime::now().duration_since(modified)?;
+    Ok(time_since > time_ago)
+}
+
 fn main() -> Result<()> {
 	env_logger::init();
 
@@ -592,121 +654,143 @@ fn main() -> Result<()> {
 	let desired_resolv =
 		read_resolv_conf(RESOLV_NM_CONF)?;
 
-	if cli.copy_search {
-		update_search_domains(
-			RESOLV_CONF,
-			&desired_resolv.search_domains,
-		)?;
-	}
 
 
 	let last_started_changed;
-	let current_last_started = fs::read(KNOT_RESOLVER_LAST_STARTED);
-
-	let known_last_started = fs::read(KNOT_RESOLVER_LAST_STARTED_KNOWN);
-	match (&current_last_started, &known_last_started) {
-		(Ok(current), Ok(known)) if current == known => {
-			last_started_changed = false;
+	let last_started_data = fs::read(KNOT_RESOLVER_LAST_STARTED);
+	match &last_started_data {
+		Ok(data) => {
 			log::debug!(
 				"{} has the same content as {}",
+				input_path,
+				known_path,
+			);
+
+			last_started_changed = !matches_known(
 				KNOT_RESOLVER_LAST_STARTED,
-				KNOT_RESOLVER_LAST_STARTED_KNOWN,
+				Some(&data),
 			);
 		}
-		(Ok(_), Ok(_)) => {
-			// Different contents
-			last_started_changed = true;
-		}
 		_ => {
-			// One or both reads failed
-			last_started_changed = true;
+			last_started_changed = true
 		}
 	}
 
-	// Fast path: NetworkManager has not changed resolv.conf since our
-	// previous successful run, so there is nothing for us to do.
-	if !resolv_conf_changed(&desired_resolv.bytes, RESOLV_NM_LATEST)? &&
-		!last_started_changed {
+
+
+	if  !matches_known(RESOLV_NM_LATEST, Some(&desired_resolv.bytes)) ||
+		last_started_changed ||
+		Cli.always_apply
+	{
+
+
+		if cli.copy_search {
+			update_search_domains(
+				RESOLV_CONF,
+				&desired_resolv.search_domains,
+			)?;
+		}
+
+		let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)
+			.with_context(|| {
+				format!(
+					"failed to read anti-RFC6761 configuration from {}",
+					RESOLV_ANTI_RFC6761
+				)
+			})?;
+
 		log::info!(
-			"{} is unchanged; exiting early",
-			RESOLV_NM_CONF
+			"anti-RFC6761 forwarding domains: {:?}",
+			anti_rfc6761
+		);
+
+		let desired_forward =
+		build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
+
+		let current_forward = get_knot_forward(&cli.kres_api_sock)?;
+
+		let desired_canonical = canonicalize_forward(&desired_forward)
+			.context("failed to canonicalize desired forward configuration")?;
+
+		let current_canonical = canonicalize_forward(&current_forward)
+			.context("failed to canonicalize current Knot forward configuration")?;
+
+		if current_canonical != desired_canonical {
+			log::info!("Knot /forward differs from desired configuration");
+
+			log::debug!(
+				"current canonical /forward: {:#?}",
+				current_canonical
+			);
+
+			log::debug!(
+				"desired canonical /forward: {:#?}",
+				desired_canonical
+			);
+
+			set_knot_forward(&desired_forward, &cli.kres_api_sock)?;
+		} else {
+			log::info!("Knot /forward is already up to date");
+		}
+
+
+		log::info!("Knot /forward updated successfully");
+
+		write_known(RESOLV_NM_LATEST, &desired_resolv.bytes)?;
+
+		log::debug!(
+			"updated {} atomically",
+			RESOLV_NM_LATEST
+		);
+
+
+
+	} else {
+		log::info!(
+			"fast path: exiting early",
 		);
 
 		return Ok(());
 	}
 
-	let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)
-		.with_context(|| {
-			format!(
-				"failed to read anti-RFC6761 configuration from {}",
-				RESOLV_ANTI_RFC6761
-			)
-		})?;
 
-	log::info!(
-		"anti-RFC6761 forwarding domains: {:?}",
-		anti_rfc6761
-	);
-
-	let desired_forward =
-		build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
-
-	let current_forward = get_knot_forward(&cli.kres_api_sock)?;
-
-	let desired_canonical = canonicalize_forward(&desired_forward)
-		.context("failed to canonicalize desired forward configuration")?;
-
-	let current_canonical = canonicalize_forward(&current_forward)
-		.context("failed to canonicalize current Knot forward configuration")?;
-
-	if current_canonical != desired_canonical {
-		log::info!("Knot /forward differs from desired configuration");
-
-		log::debug!(
-			"current canonical /forward: {:#?}",
-			current_canonical
-		);
-
-		log::debug!(
-			"desired canonical /forward: {:#?}",
-			desired_canonical
-		);
-
-		set_knot_forward(&desired_forward, &cli.kres_api_sock)?;
-	} else {
-		log::info!("Knot /forward is already up to date");
-	}
-
-
-	log::info!("Knot /forward updated successfully");
-
-	atomic_write(RESOLV_NM_LATEST, &desired_resolv.bytes)?;
-
-	log::debug!(
-		"updated {} atomically",
-		RESOLV_NM_LATEST
-	);
-
-
-	match &current_last_started {
-		Ok(current) if last_started_changed => {
-			atomic_write(
-				KNOT_RESOLVER_LAST_STARTED_KNOWN,
-				&current,
+	// cleanup
+	match &last_started_data {
+		Ok(data) if last_started_changed => {
+			write_known(
+				KNOT_RESOLVER_LAST_STARTED,
+				&data,
 			)?;
 
 			log::debug!(
 				"updated {} atomically",
-				KNOT_RESOLVER_LAST_STARTED_KNOWN,
+				get_known_path(KNOT_RESOLVER_LAST_STARTED),
 			);
 		}
 		_ => {
-			log::error!(
-				"read failed for {}",
-				KNOT_RESOLVER_LAST_STARTED,
-			);
+			let should_delete = match is_older_than(
+				get_known_path(KNOT_RESOLVER_LAST_STARTED),
+				Duration::from_hours(24), ) {
+				(Ok(value)) if !value => {
+					false
+				}
+				(Ok(value)) if value => {
+					true
+				}
+				Err(_) => {
+					true
+				}
+			};
+			if should_delete {
+				match fs::remove_file(&known_path) {
+					Ok(()) => {}
+					Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+					Err(err) => return Err(err.into()),
+				}
+			}
 		}
 	}
+
 
 	Ok(())
 }
