@@ -1,5 +1,6 @@
-use anyhow::{Context, Ok, Result};
-use resolv_conf::Config;
+use anyhow::{Context, Result};
+use std::result::Result::Ok;
+use resolv_conf::Config as rConfig;
 use serde_json::Value;
 use std::{
 	collections::HashSet, fs::{self, OpenOptions}, io::Write, net::IpAddr, path::{Path, PathBuf}, process::{Command, Stdio}, thread::{self, current}, time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,12 +19,24 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
 use clap::Parser;
 
+
+#[derive(Debug, Clone)]
+struct Config<'a> {
+	resolv_conf: &'a Path,
+	run_dir: &'a Path,
+	resolv_anti_rfc6761: &'a Path,
+
+	knot_resolver_last_started: &'a Path,
+
+	resolv_nm_conf: &'a Path,
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
 	/// unix socket path for knot-resolver kres-api.
 	#[arg(long = "kres-api-sock", default_value = "/run/knot-resolver/kres-api.sock")]
-	kres_api_sock: Path,
+	kres_api_sock: String,
 
 	/// Copy NetworkManager's search domains into /etc/resolv.conf.
 	#[arg(long = "copy-search")]
@@ -34,14 +47,6 @@ struct Cli {
 	always_apply: bool,
 }
 
-const RESOLV_CONF: &Path = "/etc/resolv.conf".into();
-const RUN_DIR: &Path = "/run/knot-nm-dns-update".into();
-const RESOLV_ANTI_RFC6761: &Path = "/etc/resolv.anti_rfc6761".into();
-
-
-const KNOT_RESOLVER_LAST_STARTED: &Path = "/run/knot-resolver/last_started".into();
-
-const RESOLV_NM_CONF: &Path = "/run/NetworkManager/resolv.conf".into();
 
 const RESOLV_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOLV_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -116,7 +121,7 @@ fn read_resolv_conf_once(
 	let data = fs::read(path)
 		.with_context(|| format!("failed to read {}", path.display()))?;
 
-	let config = Config::parse(&data)
+	let config = rConfig::parse(&data)
 		.with_context(|| format!("failed to parse {}", path.display()))?;
 
 	// Preserve the order in resolv.conf while removing duplicate
@@ -182,7 +187,7 @@ fn atomic_write(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> Result<()> {
 				)
 			})?;
 
-		file.write_all(data)
+		file.write_all(data.as_ref())
 			.with_context(|| {
 				format!(
 					"failed to write temporary file {}",
@@ -327,7 +332,7 @@ fn get_knot_forward(sock: impl AsRef<Path>) -> Result<Value> {
 			.await?
 			.to_bytes();
 
-		Ok::<Bytes, anyhow::Error>(body)
+		Ok(body)
 	})?;
 
 
@@ -345,7 +350,7 @@ fn set_knot_forward(config: &Value, sock: impl AsRef<Path>) -> Result<()> {
 
 	let runtime = tokio::runtime::Runtime::new()?;
 
-	runtime.block_on(async {
+	let _: () = runtime.block_on(async {
 		let client = Client::unix();
 
 		let uri: hyper::Uri = Uri::new(
@@ -373,7 +378,7 @@ fn set_knot_forward(config: &Value, sock: impl AsRef<Path>) -> Result<()> {
 			);
 		}
 
-		Ok::<(), anyhow::Error>(())
+		return Ok(())
 	})?;
 
 	Ok(())
@@ -565,66 +570,69 @@ fn default_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
 	return hash;
 }
 
-fn default_hash_base64(b: impl AsRef<[u8]>) -> string {
+fn default_hash_base64(b: impl AsRef<[u8]>) -> String {
 	let hash = default_hash(b);
 	let encoded = URL_SAFE_NO_PAD.encode(hash);
 	return encoded
 }
 
-fn get_known_path(path: impl AsRef<Path>) -> PathBuf {
+fn get_known_path(path: impl AsRef<Path>, cfg: &Config) -> PathBuf {
 	let path = path.as_ref();
     let mut hasher = Sha3_256::new();
     hasher.update(path.as_os_str().as_encoded_bytes());
 
     let hash = hasher.finalize();
 	let encoded = URL_SAFE_NO_PAD.encode(hash);
-	let known_path = RUN_DIR.join("known").join(encoded);
+	let known_path = cfg.run_dir.join("known").join(encoded);
 	return known_path
 }
 
 fn write_known(
 	path: impl AsRef<Path>,
 	data: &[u8],
+	cfg: &Config,
 ) -> Result<()> {
 	return atomic_write(
-		get_known_path(path.as_ref()),
+		get_known_path(path.as_ref(), cfg),
 		known_hash(&data),
 	)
 }
 
 fn known_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
-	default_hash(b);
+	return default_hash(b);
 }
 
 fn matches_known(
-	input_path: impl AsRef<Path>,
+	input_path: impl AsRef<Path> + std::fmt::Debug,
 	input_data: Option<impl AsRef<[u8]>>,
+	cfg: &Config,
 ) -> bool {
 	let path = input_path.as_ref();
 
-    let input_data: Result<Vec<u8>, Error> = match input_data {
+    let input_data: Result<Vec<u8>, anyhow::Error> = match input_data {
         Some(data) => Ok(data.as_ref().to_vec()),
-        None => fs::read(path).map_err(Error::from),
+        None => fs::read(path).map_err(anyhow::Error::from),
     };
 
-	let input_data_hashed = known_hash(input_data);
 
-	let known_path = get_known_path(path);
-	let known_data = fs::read(known_path);
+	let known_path = get_known_path(path, cfg);
+	let known_data = fs::read(&known_path);
 
-	match (&input_data_hashed, &known_data) {
-		(Ok(current), Ok(known)) if current == known => {
-			log::debug!(
-				"{} has the same content as {}",
-				input_path,
-				known_path,
-			);
+	match (&input_data, &known_data) {
+		(Ok(current), Ok(known)) => {
+			let current_hashed = known_hash(current);
 
-			true
-		}
-		(Ok(_), Ok(_)) => {
-			// Different contents
-			false
+			if current_hashed == known {
+				log::debug!(
+					"{:?} has the same content as {:?}",
+					&input_path,
+					&known_path,
+				);
+
+				true
+			} else {
+				false
+			}
 		}
 		_ => {
 			// One or both reads failed
@@ -644,6 +652,17 @@ fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
 }
 
 fn main() -> Result<()> {
+
+	let cfg = Config{
+		resolv_conf: Path::new("/etc/resolv.conf"),
+		run_dir: Path::new("/run/knot-nm-dns-update"),
+		resolv_anti_rfc6761: Path::new("/etc/resolv.anti_rfc6761"),
+
+		knot_resolver_last_started: Path::new("/run/knot-resolver/last_started"),
+
+		resolv_nm_conf: Path::new("/run/NetworkManager/resolv.conf"),
+	};
+
 	env_logger::init();
 
 	let cli = Cli::parse();
@@ -652,23 +671,18 @@ fn main() -> Result<()> {
 
 	// let (desired_nameservers, search_domains, resolv_conf_data) =
 	let desired_resolv =
-		read_resolv_conf(RESOLV_NM_CONF)?;
+		read_resolv_conf(&cfg.resolv_nm_conf)?;
 
 
 
 	let last_started_changed;
-	let last_started_data = fs::read(KNOT_RESOLVER_LAST_STARTED);
+	let last_started_data = fs::read(&cfg.knot_resolver_last_started);
 	match &last_started_data {
 		Ok(data) => {
-			log::debug!(
-				"{} has the same content as {}",
-				input_path,
-				known_path,
-			);
-
 			last_started_changed = !matches_known(
-				KNOT_RESOLVER_LAST_STARTED,
+				&cfg.knot_resolver_last_started,
 				Some(&data),
+				&cfg,
 			);
 		}
 		_ => {
@@ -678,24 +692,28 @@ fn main() -> Result<()> {
 
 
 
-	if  !matches_known(RESOLV_NM_LATEST, Some(&desired_resolv.bytes)) ||
+	if  !matches_known(
+			&cfg.resolv_nm_conf,
+			Some(&desired_resolv.bytes),
+			&cfg,
+		) ||
 		last_started_changed ||
-		Cli.always_apply
+		cli.always_apply
 	{
 
 
 		if cli.copy_search {
 			update_search_domains(
-				RESOLV_CONF,
+				&cfg.resolv_conf,
 				&desired_resolv.search_domains,
 			)?;
 		}
 
-		let anti_rfc6761 = read_anti_rfc6761(RESOLV_ANTI_RFC6761)
+		let anti_rfc6761 = read_anti_rfc6761(&cfg.resolv_anti_rfc6761)
 			.with_context(|| {
 				format!(
-					"failed to read anti-RFC6761 configuration from {}",
-					RESOLV_ANTI_RFC6761
+					"failed to read anti-RFC6761 configuration from {:?}",
+					cfg.resolv_anti_rfc6761
 				)
 			})?;
 
@@ -736,11 +754,11 @@ fn main() -> Result<()> {
 
 		log::info!("Knot /forward updated successfully");
 
-		write_known(RESOLV_NM_LATEST, &desired_resolv.bytes)?;
+		write_known(&cfg.resolv_nm_conf, &desired_resolv.bytes, &cfg)?;
 
 		log::debug!(
-			"updated {} atomically",
-			RESOLV_NM_LATEST
+			"updated {:?} atomically",
+			get_known_path(&cfg.resolv_nm_conf, &cfg),
 		);
 
 
@@ -758,23 +776,27 @@ fn main() -> Result<()> {
 	match &last_started_data {
 		Ok(data) if last_started_changed => {
 			write_known(
-				KNOT_RESOLVER_LAST_STARTED,
+				&cfg.knot_resolver_last_started,
 				&data,
+				&cfg,
 			)?;
 
 			log::debug!(
-				"updated {} atomically",
-				get_known_path(KNOT_RESOLVER_LAST_STARTED),
+				"updated {:?} atomically",
+				get_known_path(&cfg.knot_resolver_last_started, &cfg),
 			);
 		}
 		_ => {
 			let should_delete = match is_older_than(
-				get_known_path(KNOT_RESOLVER_LAST_STARTED),
+				get_known_path(&cfg.knot_resolver_last_started, &cfg),
 				Duration::from_hours(24), ) {
-				(Ok(value)) if !value => {
+				Ok(value) if !value => {
 					false
 				}
-				(Ok(value)) if value => {
+				Ok(value) if value => {
+					true
+				}
+				Ok(_) => {
 					true
 				}
 				Err(_) => {
@@ -782,7 +804,12 @@ fn main() -> Result<()> {
 				}
 			};
 			if should_delete {
-				match fs::remove_file(&known_path) {
+				match fs::remove_file(
+					&get_known_path(
+						&cfg.knot_resolver_last_started,
+						&cfg,
+					),
+				) {
 					Ok(()) => {}
 					Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
 					Err(err) => return Err(err.into()),
