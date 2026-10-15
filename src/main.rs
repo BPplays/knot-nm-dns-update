@@ -701,7 +701,7 @@ async fn main() -> Result<()> {
 		last_started_changed ||
 		!matches_known(
 			&cfg.resolv_anti_rfc6761,
-			None(),
+			None::<&[u8]>,
 			&cfg,
 		) ||
 		cli.always_apply
