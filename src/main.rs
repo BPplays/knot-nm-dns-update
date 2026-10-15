@@ -10,7 +10,6 @@ use http_body_util::{Empty, Full};
 use hyper::{body::Bytes, Request};
 use hyper_util::{
 	client::legacy::Client,
-	rt::TokioExecutor,
 };
 use hyperlocal::{UnixClientExt, Uri};
 
@@ -726,7 +725,7 @@ async fn main() -> Result<()> {
 		let desired_forward =
 		build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
 
-		let current_forward = get_knot_forward(&cli.kres_api_sock)?;
+		let current_forward = get_knot_forward(&cli.kres_api_sock).await?;
 
 		let desired_canonical = canonicalize_forward(&desired_forward)
 			.context("failed to canonicalize desired forward configuration")?;
@@ -747,7 +746,7 @@ async fn main() -> Result<()> {
 				desired_canonical
 			);
 
-			set_knot_forward(&desired_forward, &cli.kres_api_sock)?;
+			set_knot_forward(&desired_forward, &cli.kres_api_sock).await?;
 
 			log::info!("Knot /forward updated successfully");
 		} else {
