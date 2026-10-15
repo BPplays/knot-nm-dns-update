@@ -691,6 +691,14 @@ async fn main() -> Result<()> {
 	}
 
 
+	let anti_rfc6761 = read_anti_rfc6761(&cfg.resolv_anti_rfc6761)
+		.with_context(|| {
+			format!(
+				"failed to read anti-RFC6761 configuration from {:?}",
+				cfg.resolv_anti_rfc6761
+			)
+		})?;
+
 
 	if  !matches_known(
 			&cfg.resolv_nm_conf,
@@ -698,6 +706,11 @@ async fn main() -> Result<()> {
 			&cfg,
 		) ||
 		last_started_changed ||
+		!matches_known(
+			&cfg.resolv_anti_rfc6761,
+			Some(&anti_rfc6761.join("\n")),
+			&cfg,
+		) ||
 		cli.always_apply
 	{
 
@@ -709,13 +722,6 @@ async fn main() -> Result<()> {
 			)?;
 		}
 
-		let anti_rfc6761 = read_anti_rfc6761(&cfg.resolv_anti_rfc6761)
-			.with_context(|| {
-				format!(
-					"failed to read anti-RFC6761 configuration from {:?}",
-					cfg.resolv_anti_rfc6761
-				)
-			})?;
 
 		log::info!(
 			"anti-RFC6761 forwarding domains: {:?}",
