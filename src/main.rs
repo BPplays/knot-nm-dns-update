@@ -297,43 +297,37 @@ fn build_forward_config(
 	Value::Array(forwards)
 }
 
-fn get_knot_forward(sock: impl AsRef<Path>) -> Result<Value> {
-	let runtime = tokio::runtime::Runtime::new()?;
+async fn get_knot_forward(sock: impl AsRef<Path>) -> Result<Value> {
+	let client = Client::unix();
 
+	let uri: hyper::Uri = Uri::new(
+		sock,
+		"/v1/config/forward",
+	).into();
 
-	let body: Bytes = runtime.block_on(async {
-		let client = Client::unix();
+	let request = Request::get(uri)
+		.body(Empty::<Bytes>::new())?;
 
-		let uri: hyper::Uri = Uri::new(
-			sock,
-			"/v1/config/forward",
-		).into();
+	let response = client.request(request).await?;
 
-		let request = Request::get(uri)
-			.body(Empty::<Bytes>::new())?;
+	let status = response.status();
 
-		let response = client.request(request).await?;
-
-		let status = response.status();
-
-		if !status.is_success() {
-			let body = http_body_util::BodyExt::collect(response)
-				.await?
-				.to_bytes();
-
-			anyhow::bail!(
-				"Knot Resolver API returned {}: {}",
-				status,
-				String::from_utf8_lossy(&body),
-			);
-		}
-
+	if !status.is_success() {
 		let body = http_body_util::BodyExt::collect(response)
 			.await?
 			.to_bytes();
 
-		Ok(body)
-	})?;
+		anyhow::bail!(
+			"Knot Resolver API returned {}: {}",
+			status,
+			String::from_utf8_lossy(&body),
+		);
+	}
+
+	let body = http_body_util::BodyExt::collect(response)
+		.await?
+		.to_bytes();
+
 
 
 	if body.iter().all(u8::is_ascii_whitespace) {
@@ -344,42 +338,37 @@ fn get_knot_forward(sock: impl AsRef<Path>) -> Result<Value> {
 		.context("invalid JSON from kresctl")
 }
 
-fn set_knot_forward(config: &Value, sock: impl AsRef<Path>) -> Result<()> {
+async fn set_knot_forward(config: &Value, sock: impl AsRef<Path>) -> Result<()> {
 	let json = serde_json::to_vec(config)
 		.context("failed to serialize Knot forward configuration")?;
 
-	let runtime = tokio::runtime::Runtime::new()?;
+	let client = Client::unix();
 
-	let _: () = runtime.block_on(async {
-		let client = Client::unix();
+	let uri: hyper::Uri = Uri::new(
+		sock,
+		"/v1/config/forward",
+	).into();
 
-		let uri: hyper::Uri = Uri::new(
-			sock,
-			"/v1/config/forward",
-		).into();
+	let request = Request::put(uri)
+		.header("Content-Type", "application/json")
+		.body(Full::new(Bytes::from(json)))?;
 
-		let request = Request::put(uri)
-			.header("Content-Type", "application/json")
-			.body(Full::new(Bytes::from(json)))?;
+	let response = client.request(request).await?;
 
-		let response = client.request(request).await?;
+	let status = response.status();
 
-		let status = response.status();
+	let body = http_body_util::BodyExt::collect(response)
+		.await?
+		.to_bytes();
 
-		let body = http_body_util::BodyExt::collect(response)
-			.await?
-			.to_bytes();
+	if !status.is_success() {
+		anyhow::bail!(
+			"Knot Resolver API returned {}: {}",
+			status,
+			String::from_utf8_lossy(&body).trim()
+		);
+	}
 
-		if !status.is_success() {
-			anyhow::bail!(
-				"Knot Resolver API returned {}: {}",
-				status,
-				String::from_utf8_lossy(&body).trim()
-			);
-		}
-
-		return Ok(())
-	})?;
 
 	Ok(())
 }
@@ -508,7 +497,15 @@ fn update_search_domains(
 
 		let trimmed = content.trim_start();
 
-		if trimmed == "search" || trimmed.starts_with("search ") {
+		let is_search = trimmed
+			.split_ascii_whitespace()
+			.next()
+			== Some("search");
+
+		if trimmed == "search" ||
+		   trimmed.starts_with("search ") ||
+		   trimmed.starts_with("search	") ||
+		   is_search {
 			replaced = true;
 
 			if let Some(replacement) = &replacement {
@@ -587,6 +584,7 @@ fn get_known_path(path: impl AsRef<Path>, cfg: &Config) -> PathBuf {
 	return known_path
 }
 
+#[inline(always)]
 fn write_known(
 	path: impl AsRef<Path>,
 	data: &[u8],
@@ -598,6 +596,7 @@ fn write_known(
 	)
 }
 
+#[inline(always)]
 fn known_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
 	return default_hash(b);
 }
@@ -642,6 +641,7 @@ fn matches_known(
 
 }
 
+#[inline(always)]
 fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
 	let path = path.as_ref();
 
@@ -651,7 +651,8 @@ fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
     Ok(time_since > time_ago)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
 
 	let cfg = Config{
 		resolv_conf: Path::new("/etc/resolv.conf"),
@@ -747,12 +748,13 @@ fn main() -> Result<()> {
 			);
 
 			set_knot_forward(&desired_forward, &cli.kres_api_sock)?;
+
+			log::info!("Knot /forward updated successfully");
 		} else {
 			log::info!("Knot /forward is already up to date");
 		}
 
 
-		log::info!("Knot /forward updated successfully");
 
 		write_known(&cfg.resolv_nm_conf, &desired_resolv.bytes, &cfg)?;
 
