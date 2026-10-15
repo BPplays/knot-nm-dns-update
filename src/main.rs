@@ -691,13 +691,6 @@ async fn main() -> Result<()> {
 	}
 
 
-	let anti_rfc6761 = read_anti_rfc6761(&cfg.resolv_anti_rfc6761)
-		.with_context(|| {
-			format!(
-				"failed to read anti-RFC6761 configuration from {:?}",
-				cfg.resolv_anti_rfc6761
-			)
-		})?;
 
 
 	if  !matches_known(
@@ -708,7 +701,7 @@ async fn main() -> Result<()> {
 		last_started_changed ||
 		!matches_known(
 			&cfg.resolv_anti_rfc6761,
-			Some(&anti_rfc6761.join("\n")),
+			None(),
 			&cfg,
 		) ||
 		cli.always_apply
@@ -721,6 +714,14 @@ async fn main() -> Result<()> {
 				&desired_resolv.search_domains,
 			)?;
 		}
+
+		let anti_rfc6761 = read_anti_rfc6761(&cfg.resolv_anti_rfc6761)
+			.with_context(|| {
+				format!(
+					"failed to read anti-RFC6761 configuration from {:?}",
+					cfg.resolv_anti_rfc6761
+				)
+			})?;
 
 
 		log::info!(
