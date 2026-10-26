@@ -35,15 +35,15 @@ struct Config<'a> {
 struct Cli {
 	/// unix socket path for knot-resolver kres-api.
 	#[arg(long = "kres-api-sock", default_value = "/run/knot-resolver/kres-api.sock")]
-	kres_api_sock: String,
+	kres_api_sock: PathBuf,
 
 	/// Copy NetworkManager's search domains into /etc/resolv.conf.
 	#[arg(long = "copy-search")]
 	copy_search: bool,
 
-	/// Skip heuristic optimizations like only running when relevant files have changed
-	#[arg(long)]
-	always_apply: bool,
+	/// Use heuristic optimizations like only running when relevant files have changed
+	#[arg(long, default_value_t = false)]
+	fast_path: bool,
 }
 
 
@@ -692,16 +692,19 @@ async fn main() -> Result<()> {
 
 
 
-
-	if  !matches_known(
+	let do_long_path = if !cli.fast_path {
+		true
+	} else {
+		!matches_known(
 			&cfg.resolv_nm_conf,
 			Some(&desired_resolv.bytes),
 			&cfg,
-		) ||
-		last_started_changed ||
-		cli.always_apply
-	{
+		)
+		||
+		last_started_changed
+	};
 
+	if do_long_path {
 
 		if cli.copy_search {
 			update_search_domains(
