@@ -19,6 +19,41 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
 
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum CacheClear {
+    #[default]
+    None,
+    All,
+    Specific(Vec<String>),
+}
+
+impl std::str::FromStr for CacheClear {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+		match value.to_lowercase().as_str() {
+			_ if value.is_empty() => {
+				return Ok(Self::All);
+			}
+			"all" => {
+				return Ok(Self::All)
+			}
+			"none" => {
+				return Ok(Self::None)
+			}
+			_ => {}
+		}
+
+        let domains = value
+            .split(',')
+            .map(normalize_domain)
+            .collect();
+
+        Ok(Self::Specific(domains))
+    }
+}
+
+
 #[derive(Debug, Clone)]
 struct Config<'a> {
 	resolv_conf: &'a Path,
@@ -44,6 +79,18 @@ struct Cli {
 	/// Use heuristic optimizations like only running when relevant files have changed
 	#[arg(long, default_value_t = false)]
 	fast_path: bool,
+
+	/// Clear Knot Resolver's cache when upstream nameservers change.
+	///
+	/// No value clears the entire cache; a domain clears that subtree.
+	#[arg(
+		long = "clear-cache",
+		value_name = "DOMAIN[,DOMAIN...]",
+		num_args = 0..=1,
+		default_missing_value = "",
+		default_value = "",
+	)]
+	clear_cache: CacheClear,
 }
 
 
@@ -650,6 +697,109 @@ fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
     Ok(time_since > time_ago)
 }
 
+
+
+async fn clear_knot_cache(
+    mode: &CacheClear,
+    sock: impl AsRef<Path>,
+) -> Option<Result<()>> {
+    let payloads: Vec<Value> = match mode {
+        CacheClear::None => {
+            return None;
+        }
+
+        CacheClear::All => {
+            vec![serde_json::json!({})]
+        }
+
+        CacheClear::Specific(domains) => {
+			domains.iter()
+				.map(|v|
+					serde_json::json!({
+						"name": v,
+					})
+				)
+				.collect::<Vec<serde_json::Value>>()
+        }
+    };
+
+	for payload in payloads {
+		let r = clear_knot_cache_single(payload, sock.as_ref()).await;
+		match r {
+		    Err(e) => {
+				log::error!("{}", e)
+			}
+			Ok(_) => {}
+		}
+	}
+	Some(Ok(()))
+
+}
+
+async fn clear_knot_cache_single(
+	payload: Value,
+    sock: impl AsRef<Path>,
+) -> Result<()> {
+    let json = serde_json::to_vec(&payload)
+        .context("failed to serialize Knot cache-clear request")?;
+
+    let client = Client::unix();
+
+    let uri: hyper::Uri = Uri::new(
+        sock,
+        "/cache/clear",
+    ).into();
+
+    let request = Request::post(uri)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(json)))?;
+
+    let response = client.request(request).await?;
+
+    let status = response.status();
+
+    let body = http_body_util::BodyExt::collect(response)
+        .await?
+        .to_bytes();
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "Knot Resolver cache-clear API returned {}: {}",
+            status,
+            String::from_utf8_lossy(&body).trim()
+        );
+    }
+
+    let result: Value = serde_json::from_slice(&body)
+        .context("invalid JSON from Knot cache-clear API")?;
+
+    let count = result
+        .get("count")
+        .and_then(Value::as_u64)
+        .context("Knot cache-clear response is missing count")?;
+
+    log::info!(
+        "Knot Resolver cache-clear request accepted; \
+         removed {count} cache entries in this round"
+    );
+
+    if result.get("chunk_limit").and_then(Value::as_bool) == Some(true) {
+        log::info!(
+            "Knot Resolver will continue clearing the remaining \
+             cache entries asynchronously"
+        );
+    }
+
+    if result.get("not_apex").and_then(Value::as_bool) == Some(true) {
+        log::warn!(
+            "Knot Resolver reports that the cleared subtree is not a \
+             cached zone apex; some negative-cache proofs may remain"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 
@@ -754,6 +904,19 @@ async fn main() -> Result<()> {
 			set_knot_forward(&desired_forward, &cli.kres_api_sock).await?;
 
 			log::info!("Knot /forward updated successfully");
+
+			let r = clear_knot_cache(&cli.clear_cache, &cli.kres_api_sock).await;
+			match r {
+				Some(Err(e)) => {
+					log::error!("{}", e)
+				}
+				Some(Ok(_)) => {
+					log::info!("cleared cache")
+				}
+				None => {
+					log::debug!("cache clearing is disabled");
+				}
+			}
 		} else {
 			log::info!("Knot /forward is already up to date");
 		}
