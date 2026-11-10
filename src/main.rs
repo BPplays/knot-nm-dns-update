@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::result::Result::Ok;
+use std::{result::Result::Ok, sync::Arc};
 use resolv_conf::Config as rConfig;
 use serde_json::Value;
 use std::{
@@ -21,16 +21,16 @@ use clap::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum CacheClear {
-    #[default]
-    None,
-    All,
-    Specific(Vec<String>),
+	#[default]
+	None,
+	All,
+	Specific(Vec<String>),
 }
 
 impl std::str::FromStr for CacheClear {
-    type Err = std::convert::Infallible;
+	type Err = std::convert::Infallible;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
 		match value.to_lowercase().as_str() {
 			_ if value.is_empty() => {
 				return Ok(Self::All);
@@ -44,13 +44,13 @@ impl std::str::FromStr for CacheClear {
 			_ => {}
 		}
 
-        let domains = value
-            .split(',')
-            .map(normalize_domain)
-            .collect();
+		let domains = value
+			.split(',')
+			.map(normalize_domain)
+			.collect();
 
-        Ok(Self::Specific(domains))
-    }
+		Ok(Self::Specific(domains))
+	}
 }
 
 
@@ -606,10 +606,10 @@ fn update_search_domains(
 }
 
 fn default_hash(b: impl AsRef<[u8]>) -> impl AsRef<[u8]> {
-    let mut hasher = Sha3_512::new();
-    hasher.update(b);
+	let mut hasher = Sha3_512::new();
+	hasher.update(b);
 
-    let hash = hasher.finalize();
+	let hash = hasher.finalize();
 	return hash;
 }
 
@@ -621,10 +621,10 @@ fn default_hash_base64(b: impl AsRef<[u8]>) -> String {
 
 fn get_known_path(path: impl AsRef<Path>, cfg: &Config) -> PathBuf {
 	let path = path.as_ref();
-    let mut hasher = Sha3_256::new();
-    hasher.update(path.as_os_str().as_encoded_bytes());
+	let mut hasher = Sha3_256::new();
+	hasher.update(path.as_os_str().as_encoded_bytes());
 
-    let hash = hasher.finalize();
+	let hash = hasher.finalize();
 	let encoded = URL_SAFE_NO_PAD.encode(hash);
 	let known_path = cfg.run_dir.join("known").join(encoded);
 	return known_path
@@ -654,10 +654,10 @@ fn matches_known(
 ) -> bool {
 	let path = input_path.as_ref();
 
-    let input_data: Result<Vec<u8>, anyhow::Error> = match input_data {
-        Some(data) => Ok(data.as_ref().to_vec()),
-        None => fs::read(path).map_err(anyhow::Error::from),
-    };
+	let input_data: Result<Vec<u8>, anyhow::Error> = match input_data {
+		Some(data) => Ok(data.as_ref().to_vec()),
+		None => fs::read(path).map_err(anyhow::Error::from),
+	};
 
 
 	let known_path = get_known_path(path, cfg);
@@ -691,113 +691,156 @@ fn matches_known(
 fn is_older_than(path: impl AsRef<Path>, time_ago: Duration) -> Result<bool> {
 	let path = path.as_ref();
 
-    let modified = fs::metadata(path)?.modified()?;
+	let modified = fs::metadata(path)?.modified()?;
 
 	let time_since = SystemTime::now().duration_since(modified)?;
-    Ok(time_since > time_ago)
+	Ok(time_since > time_ago)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CacheClearError {
+	#[error("failed to serialize Knot cache-clear request: {0}")]
+	SerializeRequest(#[source] serde_json::Error),
 
+	#[error("failed to build Knot cache-clear request: {0}")]
+	BuildRequest(#[source] hyper::http::Error),
 
+	#[error("failed to send Knot cache-clear request: {0}")]
+	SendRequest(#[source] hyper_util::client::legacy::Error),
+
+	#[error("failed to read Knot cache-clear response body: {0}")]
+	ReadResponseBody(#[source] hyper::Error),
+
+	#[error("Knot Resolver cache-clear API returned {status}: {body}")]
+	Api {
+		status: hyper::StatusCode,
+		body: String,
+	},
+
+	#[error("invalid JSON from Knot cache-clear API: {0}")]
+	InvalidResponseJson(#[source] serde_json::Error),
+
+	#[error("Knot cache-clear response is missing count") ]
+	MissingCount,
+
+	#[error(
+		"failed to clear {count} Knot Resolver cache request(s)",
+		count = .errors.len()
+	)]
+	Multiple {
+		errors: Arc<[CacheClearError]>,
+	},
+}
 async fn clear_knot_cache(
-    mode: &CacheClear,
-    sock: impl AsRef<Path>,
-) -> Option<Result<()>> {
-    let payloads: Vec<Value> = match mode {
-        CacheClear::None => {
-            return None;
-        }
+	mode: &CacheClear,
+	sock: impl AsRef<Path>,
+) -> Option<::core::result::Result<(), CacheClearError>> {
+	let payloads: Vec<Value> = match mode {
+		CacheClear::None => {
+			return None;
+		}
 
-        CacheClear::All => {
-            vec![serde_json::json!({})]
-        }
+		CacheClear::All => {
+			vec![serde_json::json!({})]
+		}
 
-        CacheClear::Specific(domains) => {
-			domains.iter()
-				.map(|v|
+		CacheClear::Specific(domains) => {
+			domains
+				.iter()
+				.map(|v| {
 					serde_json::json!({
 						"name": v,
 					})
-				)
-				.collect::<Vec<serde_json::Value>>()
-        }
-    };
+				})
+				.collect()
+		}
+	};
+
+	let mut errors = Vec::new();
 
 	for payload in payloads {
-		let r = clear_knot_cache_single(payload, sock.as_ref()).await;
-		match r {
-		    Err(e) => {
-				log::error!("{}", e)
-			}
-			Ok(_) => {}
+		if let Err(e) = clear_knot_cache_single(payload, sock.as_ref()).await {
+			log::error!("{e}");
+			errors.push(e);
 		}
 	}
-	Some(Ok(()))
 
+	if errors.is_empty() {
+		Some(Ok(()))
+	} else {
+		Some(Err(CacheClearError::Multiple {
+			errors: errors.into(),
+		}))
+	}
 }
 
 async fn clear_knot_cache_single(
 	payload: Value,
-    sock: impl AsRef<Path>,
-) -> Result<()> {
-    let json = serde_json::to_vec(&payload)
-        .context("failed to serialize Knot cache-clear request")?;
+	sock: impl AsRef<Path>,
+) -> ::core::result::Result<(), CacheClearError> {
+	let json = serde_json::to_vec(&payload)
+		.map_err(CacheClearError::SerializeRequest)?;
 
-    let client = Client::unix();
+	let client = Client::unix();
 
-    let uri: hyper::Uri = Uri::new(
-        sock,
-        "/cache/clear",
-    ).into();
+	let uri: hyper::Uri = Uri::new(
+		sock,
+		"/cache/clear",
+	)
+	.into();
 
-    let request = Request::post(uri)
-        .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(json)))?;
+	let request = Request::post(uri)
+		.header("Content-Type", "application/json")
+		.body(Full::new(Bytes::from(json)))
+		.map_err(CacheClearError::BuildRequest)?;
 
-    let response = client.request(request).await?;
+	let response = client
+		.request(request)
+		.await
+		.map_err(CacheClearError::SendRequest)?;
 
-    let status = response.status();
+	let status = response.status();
 
-    let body = http_body_util::BodyExt::collect(response)
-        .await?
-        .to_bytes();
+	let body = http_body_util::BodyExt::collect(response)
+		.await
+		.map_err(CacheClearError::ReadResponseBody)?
+		.to_bytes();
 
-    if !status.is_success() {
-        anyhow::bail!(
-            "Knot Resolver cache-clear API returned {}: {}",
-            status,
-            String::from_utf8_lossy(&body).trim()
-        );
-    }
+	if !status.is_success() {
+		return Err(CacheClearError::Api {
+			status,
+			body: String::from_utf8_lossy(&body).trim().to_owned(),
+		});
+	}
 
-    let result: Value = serde_json::from_slice(&body)
-        .context("invalid JSON from Knot cache-clear API")?;
+	let result: Value = serde_json::from_slice(&body)
+		.map_err(CacheClearError::InvalidResponseJson)?;
 
-    let count = result
-        .get("count")
-        .and_then(Value::as_u64)
-        .context("Knot cache-clear response is missing count")?;
+	let count = result
+		.get("count")
+		.and_then(Value::as_u64)
+		.ok_or(CacheClearError::MissingCount)?;
 
-    log::info!(
-        "Knot Resolver cache-clear request accepted; \
-         removed {count} cache entries in this round"
-    );
+	log::info!(
+		"Knot Resolver cache-clear request accepted; \
+		 removed {count} cache entries in this round"
+	);
 
-    if result.get("chunk_limit").and_then(Value::as_bool) == Some(true) {
-        log::info!(
-            "Knot Resolver will continue clearing the remaining \
-             cache entries asynchronously"
-        );
-    }
+	if result.get("chunk_limit").and_then(Value::as_bool) == Some(true) {
+		log::info!(
+			"Knot Resolver will continue clearing the remaining \
+			 cache entries asynchronously"
+		);
+	}
 
-    if result.get("not_apex").and_then(Value::as_bool) == Some(true) {
-        log::warn!(
-            "Knot Resolver reports that the cleared subtree is not a \
-             cached zone apex; some negative-cache proofs may remain"
-        );
-    }
+	if result.get("not_apex").and_then(Value::as_bool) == Some(true) {
+		log::warn!(
+			"Knot Resolver reports that the cleared subtree is not a \
+			 cached zone apex; some negative-cache proofs may remain"
+		);
+	}
 
-    Ok(())
+	Ok(())
 }
 
 #[tokio::main]
@@ -905,8 +948,8 @@ async fn main() -> Result<()> {
 
 			log::info!("Knot /forward updated successfully");
 
-			let r = clear_knot_cache(&cli.clear_cache, &cli.kres_api_sock).await;
-			match r {
+			let optres = clear_knot_cache(&cli.clear_cache, &cli.kres_api_sock).await;
+			match optres {
 				Some(Err(e)) => {
 					log::error!("{}", e)
 				}
@@ -917,6 +960,9 @@ async fn main() -> Result<()> {
 					log::debug!("cache clearing is disabled");
 				}
 			}
+
+
+			log::info!("update fully finished");
 		} else {
 			log::info!("Knot /forward is already up to date");
 		}
