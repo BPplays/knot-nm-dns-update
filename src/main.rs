@@ -67,7 +67,7 @@ struct Config<'a> {
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
-struct Cli {
+struct Args {
 	/// unix socket path for knot-resolver kres-api.
 	#[arg(long = "kres-api-sock", default_value = "/run/knot-resolver/kres-api.sock")]
 	kres_api_sock: PathBuf,
@@ -88,7 +88,7 @@ struct Cli {
 		value_name = "DOMAIN[,DOMAIN...]",
 		num_args = 0..=1,
 		default_missing_value = "",
-		default_value = "",
+		default_value = "none",
 	)]
 	clear_cache: CacheClear,
 }
@@ -858,7 +858,7 @@ async fn main() -> Result<()> {
 
 	env_logger::init();
 
-	let cli = Cli::parse();
+	let args = Args::parse();
 
 	log::info!("starting Knot Resolver NetworkManager DNS updater");
 
@@ -885,7 +885,7 @@ async fn main() -> Result<()> {
 
 
 
-	let do_long_path = if !cli.fast_path {
+	let do_long_path = if !args.fast_path {
 		true
 	} else {
 		!matches_known(
@@ -899,7 +899,7 @@ async fn main() -> Result<()> {
 
 	if do_long_path {
 
-		if cli.copy_search {
+		if args.copy_search {
 			update_search_domains(
 				&cfg.resolv_conf,
 				&desired_resolv.search_domains,
@@ -923,7 +923,7 @@ async fn main() -> Result<()> {
 		let desired_forward =
 		build_forward_config(&desired_resolv.nameservers, &anti_rfc6761);
 
-		let current_forward = get_knot_forward(&cli.kres_api_sock).await?;
+		let current_forward = get_knot_forward(&args.kres_api_sock).await?;
 
 		let desired_canonical = canonicalize_forward(&desired_forward)
 			.context("failed to canonicalize desired forward configuration")?;
@@ -944,11 +944,11 @@ async fn main() -> Result<()> {
 				desired_canonical
 			);
 
-			set_knot_forward(&desired_forward, &cli.kres_api_sock).await?;
+			set_knot_forward(&desired_forward, &args.kres_api_sock).await?;
 
 			log::info!("Knot /forward updated successfully");
 
-			let optres = clear_knot_cache(&cli.clear_cache, &cli.kres_api_sock).await;
+			let optres = clear_knot_cache(&args.clear_cache, &args.kres_api_sock).await;
 			match optres {
 				Some(Err(e)) => {
 					log::error!("{}", e)
