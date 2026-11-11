@@ -31,10 +31,9 @@ impl std::str::FromStr for CacheClear {
 	type Err = std::convert::Infallible;
 
 	fn from_str(value: &str) -> Result<Self, Self::Err> {
-		match value.to_lowercase().as_str() {
-			_ if value.is_empty() => {
-				return Ok(Self::All);
-			}
+		match value.trim().to_lowercase().as_str() {
+			"" |
+			"." |
 			"all" => {
 				return Ok(Self::All)
 			}
@@ -46,6 +45,7 @@ impl std::str::FromStr for CacheClear {
 
 		let domains = value
 			.split(',')
+			.map(str::trim)
 			.map(normalize_domain)
 			.collect();
 
