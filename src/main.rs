@@ -949,14 +949,18 @@ async fn main() -> Result<()> {
 			log::info!("Knot /forward updated successfully");
 
 			let optres = clear_knot_cache(&args.clear_cache, &args.kres_api_sock).await;
-			match optres {
-				Some(Err(e)) => {
+			match (optres, &args.clear_cache) {
+				(Some(Err(e)), _) => {
 					log::error!("{}", e)
 				}
-				Some(Ok(_)) => {
+				(Some(Ok(_)), CacheClear::All) => {
 					log::info!("cleared cache")
 				}
-				None => {
+				(Some(Ok(_)), CacheClear::Specific(domains)) => {
+					log::info!("cleared cache for: [{}]", domains.join(", "))
+				}
+				(Some(Ok(_)), CacheClear::None) |
+				(None, _) => {
 					log::debug!("cache clearing is disabled");
 				}
 			}
